@@ -20,6 +20,11 @@ def create_modules(module_defs):
     hyperparams = module_defs.pop(0)
     output_filters = [int(hyperparams["channels"])]
     module_list = nn.ModuleList()
+    
+    num_shortcut = 0
+    YOLO_enocder_list = nn.ModuleList()
+    YOLO_decoder_list = nn.ModuleList()
+
     for module_i, module_def in enumerate(module_defs):
         modules = nn.Sequential()
 
@@ -62,10 +67,12 @@ def create_modules(module_defs):
             modules.add_module(f"route_{module_i}", EmptyLayer())
 
         elif module_def["type"] == "shortcut":
+            num_shortcut +=1
             filters = output_filters[1:][int(module_def["from"])]
             modules.add_module(f"shortcut_{module_i}", EmptyLayer())
 
         elif module_def["type"] == "yolo":
+
             anchor_idxs = [int(x) for x in module_def["mask"].split(",")]
             # Extract anchors
             anchors = [int(x) for x in module_def["anchors"].split(",")]
@@ -78,9 +85,17 @@ def create_modules(module_defs):
             modules.add_module(f"yolo_{module_i}", yolo_layer)
         # Register module list and number of output filters
         module_list.append(modules)
+        
+        if num_shortcut == 23:
+            YOLO_enocder_list = module_list
+            num_shortcut +=1
+
+        elif num_shortcut > 23:
+            YOLO_decoder_list.append(modules)
         output_filters.append(filters)
 
-    return hyperparams, module_list
+
+    return hyperparams, module_list, YOLO_enocder_list, YOLO_decoder_list
 
 
 class Upsample(nn.Module):
@@ -236,22 +251,65 @@ class Darknet(nn.Module):
 
     def __init__(self, config_path, img_size=416):
         super(Darknet, self).__init__()
-        self.module_defs = parse_model_config(config_path)
-        self.hyperparams, self.module_list = create_modules(self.module_defs)
+        self.module_defs, self.YOLO_encoder_defs, self.YOLO_decoder_defs = parse_model_config(config_path)
+        self.hyperparams, self.module_list, self.YOLO_enocder_list, self.YOLO_decoder_list  = create_modules(self.module_defs)
         self.yolo_layers = [layer[0] for layer in self.module_list if hasattr(layer[0], "metrics")]
         self.img_size = img_size
         self.seen = 0
         self.header_info = np.array([0, 0, 0, self.seen, 0], dtype=np.int32)
+        
 
     def forward(self, x, targets=None):
+          
         img_dim = x.shape[2]
         loss = 0
         layer_outputs, yolo_outputs = [], []
-        for i, (module_def, module) in enumerate(zip(self.module_defs, self.module_list)):
+        
+        ## YOLO Encoder - YOLO Decoder
+        layer_outputs, x   = self.forward_YOLO_encoder(x, layer_outputs)
+        if targets is not None:
+             loss, yolo_outputs = self.forward_YOLO_decoder(x, img_dim, targets, layer_outputs, yolo_outputs, loss)
+        else:
+             yolo_outputs = self.forward_YOLO_decoder(x, img_dim, targets, layer_outputs, yolo_outputs, loss)
+
+
+        ## TODO: FCN Encoder - FCN  Decoder
+        ## TODO: FCN Encoder - YOLO Decoder
+
+        return yolo_outputs if targets is None else (loss, yolo_outputs)
+
+    def forward_YOLO_encoder(self, x, layer_outputs):
+
+        for _, (module_def, module) in enumerate(zip(self.YOLO_encoder_defs, self.YOLO_enocder_list)):
+            print(x.shape)
+            if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
+                x = module(x)
+
+            elif module_def["type"] == "shortcut":
+                layer_i = int(module_def["from"])
+                x = layer_outputs[-1] + layer_outputs[layer_i]
+            
+            layer_outputs.append(x)
+
+            print(x.shape)
+            print(module_def["type"])
+
+        return layer_outputs, x
+
+    def forward_YOLO_decoder(self, x, img_dim, targets, layer_outputs, yolo_outputs, loss):
+        print("*********************************")
+        print (len(self.YOLO_decoder_defs))
+        print (len(self.YOLO_decoder_list))
+        for _, (module_def, module) in enumerate(zip(self.YOLO_decoder_defs, self.YOLO_decoder_list)):
+            print(len(layer_outputs))
+            print(x.shape)
+            print(module_def["type"])
             if module_def["type"] in ["convolutional", "upsample", "maxpool"]:
                 x = module(x)
             elif module_def["type"] == "route":
                 x = torch.cat([layer_outputs[int(layer_i)] for layer_i in module_def["layers"].split(",")], 1)
+                rr = [int(layer_i) for layer_i in module_def["layers"].split(",")]
+                print(rr)
             elif module_def["type"] == "shortcut":
                 layer_i = int(module_def["from"])
                 x = layer_outputs[-1] + layer_outputs[layer_i]
@@ -259,9 +317,15 @@ class Darknet(nn.Module):
                 x, layer_loss = module[0](x, targets, img_dim)
                 loss += layer_loss
                 yolo_outputs.append(x)
+            
+            print(x.shape)
+            print("**************************")
             layer_outputs.append(x)
         yolo_outputs = to_cpu(torch.cat(yolo_outputs, 1))
         return yolo_outputs if targets is None else (loss, yolo_outputs)
+
+
+        
 
     def load_darknet_weights(self, weights_path):
         """Parses and loads the weights stored in 'weights_path'"""
